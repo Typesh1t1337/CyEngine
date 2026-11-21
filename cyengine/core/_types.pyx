@@ -3,6 +3,11 @@
 # cython: wraparound=False
 # cython: nonecheck=False
 
+import time
+from email.utils import formatdate
+from http import HTTPStatus
+from urllib.parse import unquote_plus
+
 import orjson
 
 from libc.string cimport memchr
@@ -11,15 +16,6 @@ from libc.string cimport memchr
 
 class CyEngineError(Exception):
     """Базовый класс всех ошибок фреймворка."""
-
-
-class ProviderNotRegistered(CyEngineError):
-    def __init__(self, cls: type) -> None:
-        super().__init__(
-            f"Provider '{cls.__name__}' is not registered. "
-            f"Call app.provide({cls.__name__}, ...) before app.run()."
-        )
-        self.cls = cls
 
 
 class RouterNotFound(CyEngineError):
@@ -34,6 +30,14 @@ class MethodNotAllowed(CyEngineError):
         super().__init__(f"{method} {path}")
         self.method  = method
         self.path    = path
+
+
+cdef str _decode_qs(bytes part):
+    """%xx и '+' → символы; fast path для частей без экранирования."""
+    cdef str s = part.decode("utf-8", errors="replace")
+    if b"%" in part or b"+" in part:
+        return unquote_plus(s)
+    return s
 
 
 cdef dict _parse_query(bytes qs):
@@ -51,13 +55,68 @@ cdef dict _parse_query(bytes qs):
     cdef int    sep
 
     for pair in pairs:
-        if b"=" in pair:
-            k, _, v = pair.partition(b"=")
-            result[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
-        elif pair:
-            result[pair.decode("utf-8", errors="replace")] = ""
+        if not pair:
+            continue
+        k, _, v = pair.partition(b"=")
+        result[_decode_qs(k)] = _decode_qs(v)
 
     return result
+
+
+cdef dict _ADAPTERS = {}
+
+
+cdef object _adapter(object model):
+    """TypeAdapter на модель — один раз, дальше из кэша."""
+    ta = _ADAPTERS.get(model)
+    if ta is None:
+        try:
+            from pydantic import TypeAdapter
+        except ImportError:
+            raise ImportError("request.parse() needs pydantic: pip install pydantic") from None
+        ta = TypeAdapter(model)
+        _ADAPTERS[model] = ta
+    return ta
+
+
+cdef object _jsonable(object value):
+    try:
+        orjson.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+cdef object _invalid(object exc, str source):
+    """pydantic.ValidationError → RequestValidationError (422). Холодный путь."""
+    from cyengine.errors import RequestValidationError
+    return RequestValidationError([
+        {"type": e["type"], "loc": [source] + list(e["loc"]), "msg": e["msg"],
+         "input": _jsonable(e.get("input"))}
+        for e in exc.errors(include_url=False, include_context=False)
+    ])
+
+
+cdef bytes _dumps(object data):
+    """
+    Объект → JSON bytes. dict/list — orjson; модели pydantic (и контейнеры с
+    моделями) — pydantic-core пишет прямо в bytes, без промежуточного dict.
+    """
+    cdef object ser
+    if type(data) is dict or type(data) is list:
+        try:
+            return orjson.dumps(data)
+        except TypeError:
+            from pydantic_core import to_json     # внутри есть модель
+            return to_json(data, by_alias=True)
+    ser = getattr(type(data), "__pydantic_serializer__", None)
+    if ser is not None:
+        return ser.to_json(data, by_alias=True)
+    try:
+        return orjson.dumps(data)
+    except TypeError:
+        from pydantic_core import to_json
+        return to_json(data, by_alias=True)
 
 
 # ─── Request ─────────────────────────────────────────────────────────────────
@@ -83,8 +142,9 @@ cdef class Request:
     cdef public dict   path_params    # str → Any, typed by router
 
     # приватные — инфраструктура протокола
-    cdef public bytearray _body
+    cdef public object    _body       # bytes (один кусок, без копии) | bytearray
     cdef        dict      _query      # None до первого .query
+    cdef        dict      _state      # None до первого .state
     cdef public object    _app
     cdef public object    _transport
 
@@ -94,8 +154,9 @@ cdef class Request:
         self.query_string = b""
         self.headers      = {}
         self.path_params  = {}
-        self._body        = bytearray()
+        self._body        = b""
         self._query       = None
+        self._state       = None
         self._app         = None
         self._transport   = None
 
@@ -121,6 +182,29 @@ cdef class Request:
             self._query = _parse_query(self.query_string)
         return self._query
 
+    # ── клиент ───────────────────────────────────────────────────────────────
+
+    @property
+    def client(self):
+        """Адрес клиента: (host, port), или None, если соединение уже закрыто."""
+        if self._transport is None:
+            return None
+        return self._transport.get_extra_info("peername")
+
+    # ── state ────────────────────────────────────────────────────────────────
+
+    @property
+    def state(self) -> dict:
+        """
+        Произвольные данные запроса — для передачи из middleware в хендлер.
+
+            request.state["user"] = user        # в middleware
+            user = request.state["user"]        # в хендлере
+        """
+        if self._state is None:
+            self._state = {}
+        return self._state
+
     # ── тело ─────────────────────────────────────────────────────────────────
 
     cpdef bytes body(self):
@@ -128,26 +212,52 @@ cdef class Request:
         return bytes(self._body)
 
     cpdef object json(self):
-        """Десериализовать тело как JSON через orjson."""
-        return orjson.loads(self._body)
+        """
+        Десериализовать тело как JSON через orjson.
+        Невалидный или пустой JSON → BadRequest (400).
+        """
+        try:
+            return orjson.loads(self._body)
+        except orjson.JSONDecodeError:
+            from cyengine.errors import BadRequest
+            raise BadRequest("invalid JSON body") from None
+
+    cpdef object parse(self, object model):
+        """
+        Тело (JSON) → экземпляр pydantic-модели (или любого типа, который понимает
+        TypeAdapter: list[Model], dict[str, int]). Парсит и валидирует за один проход
+        в Rust (validate_json): промежуточных dict/list нет, тело не копируется.
+        Не прошло → RequestValidationError (422).
+
+            user = request.parse(CreateUser)
+        """
+        ta = _adapter(model)
+        try:
+            return ta.validate_json(self._body)
+        except Exception as exc:
+            from pydantic import ValidationError
+            if isinstance(exc, ValidationError):
+                raise _invalid(exc, "body") from None
+            raise
+
+    cpdef object parse_query(self, object model):
+        """Query string → модель (значения-строки приводятся к типам полей)."""
+        ta = _adapter(model)
+        try:
+            return ta.validate_python(self.query)
+        except Exception as exc:
+            from pydantic import ValidationError
+            if isinstance(exc, ValidationError):
+                raise _invalid(exc, "query") from None
+            raise
 
     cpdef str text(self, str encoding="utf-8"):
-        """Тело как строка."""
-        return self._body.decode(encoding)
-
-    # ── провайдеры (DI) ──────────────────────────────────────────────────────
-
-    cpdef object provide(self, object cls):
-        """
-        Получить зарегистрированный провайдер по типу.
-
-        Usage:
-            db = request.provide(Database)
-            cache = request.provide(Cache)
-        """
-        if self._app is None:
-            raise ProviderNotRegistered(cls)
-        return self._app._get_provider(cls)
+        """Тело как строка. Не декодируется → BadRequest (400)."""
+        try:
+            return self._body.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            from cyengine.errors import BadRequest
+            raise BadRequest(f"body is not valid {encoding}") from None
 
     # ── repr ─────────────────────────────────────────────────────────────────
 
@@ -174,6 +284,30 @@ cdef dict _STATUS_LINES = {
     502: b"HTTP/1.1 502 Bad Gateway\r\n",
     503: b"HTTP/1.1 503 Service Unavailable\r\n",
 }
+
+cdef long _date_sec = 0
+cdef bytes _date_line = b""
+
+
+cpdef bytes date_header():
+    """Строка `Date: ...\\r\\n`; форматируется раз в секунду, а не на каждый ответ."""
+    global _date_sec, _date_line
+    cdef long now = <long>time.time()
+    if now != _date_sec:
+        _date_sec = now
+        _date_line = b"Date: " + formatdate(now, usegmt=True).encode() + b"\r\n"
+    return _date_line
+
+
+def _reason(int status):
+    try:
+        return HTTPStatus(status).phrase.encode()
+    except ValueError:
+        return b"Unknown"
+
+
+cdef dict _HEADER_KEYS = {}
+
 
 cdef bytes _SERVER   = b"Server: cyframe\r\n"
 cdef bytes _CONN_KA  = b"Connection: keep-alive\r\n"
@@ -214,7 +348,7 @@ cdef class Response:
         """
         cdef dict h = headers if headers is not None else {}
         h.setdefault("Content-Type", "application/json")
-        return cls(body=orjson.dumps(data), status=status, headers=h)
+        return cls(body=_dumps(data), status=status, headers=h)
 
     @classmethod
     def text(cls, str data, int status = 200, dict headers = None):
@@ -223,39 +357,55 @@ cdef class Response:
         return cls(body=data.encode("utf-8"), status=status, headers=h)
 
     @classmethod
-    def empty(cls, int status = 204):
-        return cls(body=b"", status=status)
+    def empty(cls, int status = 204, dict headers = None):
+        return cls(body=b"", status=status, headers=headers)
 
-    cpdef bytes render(self, bint keep_alive = True):
+    cpdef bytes render(self, bint keep_alive = True, bint head = False):
         """
         Сериализовать в HTTP/1.1 wire-формат.
         Вызывается один раз на запрос протоколом.
+
+        head=True (ответ на HEAD): заголовки как для GET, включая
+        Content-Length, но без тела.
         """
         cdef bytearray buf
         cdef bytes     status_line
         cdef bytes     cl_header
 
         # status line — из prealloc dict, O(1) lookup
-        status_line = _STATUS_LINES.get(
-            self.status,
-            b"HTTP/1.1 " + str(self.status).encode() + _CRLF
-        )
+        status_line = _STATUS_LINES.get(self.status)
+        if status_line is None:      # редкий код: строку собираем (раньше собиралась всегда)
+            status_line = (b"HTTP/1.1 " + str(self.status).encode() + b" "
+                           + _reason(self.status) + _CRLF)
 
-        cl_header = b"Content-Length: " + str(len(self.body)).encode() + _CRLF
+        # у 1xx / 204 / 304 тела нет и Content-Length слать нельзя
+        if self.status < 200 or self.status == 204 or self.status == 304:
+            cl_header = b""
+        else:
+            cl_header = b"Content-Length: " + str(len(self.body)).encode() + _CRLF
 
         buf  = bytearray(status_line)
         buf += _SERVER
+        buf += date_header()
         buf += _CONN_KA if keep_alive else _CONN_CL
         buf += cl_header
 
         # пользовательские заголовки
         cdef str k, v
+        cdef bytes kline
         for k, v in self.headers.items():
-            buf += k.encode("latin-1") + b": " + v.encode("latin-1") + _CRLF
+            kline = _HEADER_KEYS.get(k)      # "Content-Type" → b"Content-Type: " один раз
+            if kline is None:
+                kline = k.encode("latin-1") + b": "
+                if len(_HEADER_KEYS) < 256:
+                    _HEADER_KEYS[k] = kline
+            buf += kline
+            buf += v.encode("latin-1")
+            buf += _CRLF
 
         buf += _CRLF
 
-        if self.body:
+        if self.body and not head:
             buf += self.body
 
         return bytes(buf)

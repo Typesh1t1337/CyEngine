@@ -12,6 +12,8 @@ CyFrame Router — Trie-based HTTP router.
 """
 
 
+from urllib.parse import unquote
+
 from cyengine.core._types import MethodNotAllowed, RouterNotFound
 
 
@@ -94,6 +96,11 @@ cdef class Router:
                     node.param_child = child
                 else:
                     child = node.param_child
+                    if child.param_name != pname or child.param_type != ptype:
+                        raise ValueError(
+                            f"route {path!r}: parameter <{pname}> conflicts with "
+                            f"<{child.param_name}> already registered at this position"
+                        )
                 node = child
             else:
                 if seg not in node.children:
@@ -106,47 +113,33 @@ cdef class Router:
 
 
     cpdef tuple match(self, str method, str path):
-        cdef TrieNode node = self._root
-        cdef list segments = _split_path(path)
+        cdef list segments = _segments(path)
         cdef dict params = {}
-        cdef str seg
+        cdef TrieNode node = _walk(self._root, segments, 0, params)
         cdef object handler
 
-        for seg in segments:
-            if seg in node.children:
-                node = node.children[seg]
-                continue
-
-            if node.param_child is not None:
-                child = node.param_child
-
-                if child.param_type == PARAM_PATH:
-                    idx = segments.index(seg)
-                    params[child.param_name] = "/".join(segments[idx:])
-                    node = child
-                    break
-
-                coerced = _coerce(child.param_type, seg)
-                if coerced is None:
-                    raise RouterNotFound(method, path)
-                params[child.param_name] = coerced
-                node = child
-                continue
-
+        if node is None:
             raise RouterNotFound(method, path)
 
-        if node.handlers is None:
-            raise RouterNotFound(method, path)
-
-        method_upper = method.upper()
+        cdef str method_upper = method.upper()
         handler = node.handlers.get(method_upper)
+        if handler is None and method_upper == "HEAD":
+            # HEAD без своего хендлера = GET (тело отбросит протокол)
+            handler = node.handlers.get("GET")
         if handler is None:
-            if node.handlers:
-                raise MethodNotAllowed(method, path)
-            raise RouterNotFound(method, path)
+            raise MethodNotAllowed(method, path)
 
         return (handler, params)
 
+    cpdef list allowed(self, str path):
+        """HTTP-методы, зарегистрированные для пути (для заголовка Allow)."""
+        cdef TrieNode node = _walk(self._root, _segments(path), 0, {})
+        if node is None:
+            return []
+        cdef set methods = set(node.handlers)
+        if "GET" in methods:
+            methods.add("HEAD")
+        return sorted(methods)
 
     cpdef void get(self, str path, object handler):
         self.add("GET", path, handler)
@@ -169,6 +162,54 @@ cdef class Router:
         result = []
         _collect(self._root, "", result)
         return result
+
+
+cdef TrieNode _walk(TrieNode node, list segments, int i, dict params):
+    """
+    Поиск узла с откатом: статический сегмент в приоритете над параметром,
+    но если статическая ветка не привела к хэндлеру — пробуем параметр.
+    """
+    cdef TrieNode child, found
+    cdef str seg
+    cdef object coerced
+
+    if i == len(segments):
+        return node if node.handlers is not None else None
+
+    seg = segments[i]
+
+    child = node.children.get(seg)
+    if child is not None:
+        found = _walk(child, segments, i + 1, params)
+        if found is not None:
+            return found
+
+    child = node.param_child
+    if child is not None:
+        if child.param_type == PARAM_PATH:
+            if child.handlers is None:
+                return None
+            params[child.param_name] = "/".join(segments[i:])
+            return child
+
+        coerced = _coerce(child.param_type, seg)
+        if coerced is not None:
+            params[child.param_name] = coerced
+            found = _walk(child, segments, i + 1, params)
+            if found is not None:
+                return found
+            del params[child.param_name]
+
+    return None
+
+
+cdef list _segments(str path):
+    """Сегменты пути для матчинга: %xx декодируются ПОСЛЕ разбиения по '/',
+    поэтому %2F внутри сегмента не становится разделителем."""
+    cdef list segs = _split_path(path)
+    if "%" in path:
+        segs = [unquote(s) for s in segs]
+    return segs
 
 
 cdef list _split_path(str path):

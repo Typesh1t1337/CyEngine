@@ -1,8 +1,6 @@
 import asyncio
 import os
-
 import signal
-import sys
 
 try:
     import uvloop
@@ -12,60 +10,95 @@ except ImportError:
     _UVLOOP = False
 
 
-async def _serve(app, host: str, port: int):
-    loop = asyncio.get_event_loop()
+async def serve(app, host: str, port: int, backlog: int = 2048, grace: float = 10.0):
+    """
+    Поднять сервер и блокироваться до SIGINT/SIGTERM.
+
+    После сигнала: перестаёт принимать соединения, ждёт текущие запросы
+    (до `grace` секунд), закрывает keep-alive соединения и возвращает управление —
+    дальше в main() отрабатывает код закрытия зависимостей.
+    """
+    loop = asyncio.get_running_loop()
+    app._router = app._build_router()
 
     server = await loop.create_server(
         lambda: app._make_protocol(loop),
         host=host,
         port=port,
         reuse_port=True,
-        backlog=2048
+        backlog=backlog,
     )
 
     addr = server.sockets[0].getsockname()
-    print(f"  cyengine   http://{addr[0]}:{addr[1]}")
-    print(f"  uvloop    {'yes' if _UVLOOP else 'no — pip install uvloop'}")
+    print(f"  cyengine  http://{addr[0]}:{addr[1]}")
+    # реальный loop, а не «установлен ли uvloop»: serve() работает в том loop, где его вызвали
+    loop_name = type(loop).__module__.split(".")[0]
+    hint = "" if loop_name == "uvloop" else "  (uvloop быстрее: uvloop.run(main()))"
+    print(f"  loop      {loop_name}{hint}")
     print(f"  pid       {os.getpid()}")
 
-    loop.add_signal_handler(signal.SIGTERM, server.close)
-    loop.add_signal_handler(signal.SIGINT,  server.close)
+    sweeper = asyncio.create_task(_sweep(app, loop))
 
-    async with server:
-        await server.serve_forever()
-
-
-def run(app, host: str = "0.0.0.0", port: int = 8000, workers: int = 1):
-    if workers > 1:
-        _fork(app, host, port, workers)
-    else:
-        _single(app, host, port)
-
-
-def _single(app, host, port):
-    if _UVLOOP:
-        uvloop.run(_serve(app, host, port))
-    else:
-        asyncio.run(_serve(app, host, port))
-
-
-def _fork(app, host: str, port: int, workers: int):
-    pids = []
-
-    for _ in range(workers - 1):
-        pid = os.fork()
-        if pid == 0:
-            _single(app, host, port)
-            sys.exit(0)
-
-        pids.append(pid)
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
 
     try:
-        _single(app, host, port)
+        await stop.wait()
     finally:
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+        sweeper.cancel()
+        await _shutdown(app, server, grace)
 
+
+async def _sweep(app, loop):
+    """
+    Один сторожевой таймер на весь сервер вместо таймеров на каждый запрос:
+    раз в `interval` проверяет дедлайны read/keep-alive у соединений и
+    handler_timeout у запросов. На горячем пути остаётся только запись числа.
+    """
+    lim = app._limits
+    active = [t for t in (lim.read_timeout, lim.keepalive_timeout, lim.handler_timeout)
+              if t is not None]
+    if not active:
+        return
+    interval = min(1.0, max(0.05, min(active) / 4))
+
+    while True:
+        await asyncio.sleep(interval)
+        now = loop.time()
+        for task, deadline in tuple(app._tasks.items()):
+            if deadline and now >= deadline and task not in app._timed_out:
+                app._timed_out.add(task)
+                task.cancel()
+        for proto in tuple(app._protocols):
+            proto._check_deadline(now)
+
+
+async def _shutdown(app, server, grace: float):
+    server.close()
+
+    if app._tasks:
+        _, pending = await asyncio.wait(set(app._tasks), timeout=grace)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    for proto in list(app._protocols):
+        proto.close()
+
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+
+
+def run(app, host: str = "0.0.0.0", port: int = 8000):
+    """Sync-обёртка для приложений без зависимостей, которым нужен close."""
+    coro = serve(app, host, port)
+    if _UVLOOP:
+        uvloop.run(coro)
+    else:
+        asyncio.run(coro)
