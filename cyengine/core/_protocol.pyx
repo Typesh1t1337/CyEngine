@@ -291,7 +291,14 @@ class HttpProtocol(asyncio.Protocol):
                 self._write(_raw(_E500), keep_alive=False)
                 return
 
-            self._write(response.render(keep_alive, request.method == "HEAD"), keep_alive)
+            try:
+                raw = response.render(keep_alive, request.method == "HEAD")
+            except Exception:
+                # невалидный заголовок (CR/LF, не latin-1, плохое имя): не оставляем клиента без ответа
+                log.exception("invalid response for %s %s", request.method, request.path)
+                self._write(_raw(_E500), keep_alive=False)
+                return
+            self._write(raw, keep_alive)
         finally:
             self._inflight -= 1
             if (keep_alive and self._inflight == 0 and not self._receiving

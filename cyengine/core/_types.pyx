@@ -3,8 +3,10 @@
 # cython: wraparound=False
 # cython: nonecheck=False
 
+import re
 import time
-from email.utils import formatdate
+from datetime import datetime, timezone
+from email.utils import format_datetime, formatdate
 from http import HTTPStatus
 from urllib.parse import unquote_plus
 
@@ -38,6 +40,22 @@ cdef str _decode_qs(bytes part):
     if b"%" in part or b"+" in part:
         return unquote_plus(s)
     return s
+
+
+cdef dict _parse_cookies(str header):
+    """Cookie: a=1; b="x y" → {"a": "1", "b": "x y"}; при дубликатах побеждает первый."""
+    cdef dict result = {}
+    cdef str part, k, eq, v
+    for part in header.split(";"):
+        k, eq, v = part.partition("=")
+        k = k.strip()
+        if not k or not eq:
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == '"' and v[len(v) - 1] == '"':
+            v = v[1:len(v) - 1]
+        result.setdefault(k, v)
+    return result
 
 
 cdef dict _parse_query(bytes qs):
@@ -145,6 +163,7 @@ cdef class Request:
     cdef public object    _body       # bytes (один кусок, без копии) | bytearray
     cdef        dict      _query      # None до первого .query
     cdef        dict      _state      # None до первого .state
+    cdef        dict      _cookies    # None до первого .cookies
     cdef public object    _app
     cdef public object    _transport
 
@@ -157,6 +176,7 @@ cdef class Request:
         self._body        = b""
         self._query       = None
         self._state       = None
+        self._cookies     = None
         self._app         = None
         self._transport   = None
 
@@ -181,6 +201,13 @@ cdef class Request:
         if self._query is None:
             self._query = _parse_query(self.query_string)
         return self._query
+
+    @property
+    def cookies(self) -> dict:
+        """Cookie запроса: {"имя": "значение"}. Парсится при первом обращении."""
+        if self._cookies is None:
+            self._cookies = _parse_cookies(self.headers.get("cookie", ""))
+        return self._cookies
 
     # ── клиент ───────────────────────────────────────────────────────────────
 
@@ -308,6 +335,45 @@ def _reason(int status):
 
 cdef dict _HEADER_KEYS = {}
 
+# RFC 9110 token: имя заголовка / cookie. Пробел, ':', CR, LF и т.п. недопустимы.
+_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+# cookie-octet по RFC 6265: без CTL, пробела, ", запятой, ;, \\ и не-ASCII
+_COOKIE_VALUE_BAD = re.compile(r'[\x00-\x20",;\\\x7f-\uffff]')
+_ATTR_BAD = re.compile(r"[\x00-\x1f;\x7f]")
+
+
+def _check_attr(str what, str value):
+    if _ATTR_BAD.search(value) is not None:
+        raise ValueError(f"invalid cookie {what}: ';' and control characters are not allowed")
+
+
+cdef bytes _header_key(str name):
+    """Валидирует имя заголовка и кэширует готовую `Name: `-строку."""
+    if _TOKEN.fullmatch(name) is None:
+        raise ValueError(f"invalid header name {name!r}")
+    cdef bytes kline = name.encode("latin-1") + b": "
+    if len(_HEADER_KEYS) < 256:
+        _HEADER_KEYS[name] = kline
+    return kline
+
+
+cdef dict _VALUES = {}      # уже проверенные значения → bytes (application/json и т.п. повторяются)
+
+
+cdef bytes _header_value(str name, str value):
+    """CR / LF / NUL в значении = header injection (подмена заголовков и тела ответа)."""
+    cdef bytes vb = _VALUES.get(value)
+    if vb is not None:
+        return vb
+    vb = value.encode("latin-1")
+    if b"\r" in vb or b"\n" in vb or b"\0" in vb:
+        raise ValueError(f"invalid value for header {name!r}: CR, LF and NUL are not allowed")
+    if len(_VALUES) < 256 and len(vb) <= 128:     # ограничен: уникальные значения не раздуют память
+        _VALUES[value] = vb
+    return vb
+
 
 cdef bytes _SERVER   = b"Server: cyframe\r\n"
 cdef bytes _CONN_KA  = b"Connection: keep-alive\r\n"
@@ -324,7 +390,7 @@ cdef class Response:
     """
     cdef public int    status
     cdef public bytes  body
-    cdef public dict   headers    # str → str
+    cdef public dict   headers    # str → str | list[str] (несколько строк)
     cdef public bint   keep_alive
 
     def __cinit__(self,
@@ -360,6 +426,67 @@ cdef class Response:
     def empty(cls, int status = 204, dict headers = None):
         return cls(body=b"", status=status, headers=headers)
 
+    def set_cookie(self, str name, str value = "", *, object max_age = None,
+                   object expires = None, str path = "/", object domain = None,
+                   bint secure = False, bint httponly = True, object samesite = "lax"):
+        """
+        Добавить Set-Cookie (можно вызывать несколько раз — строки накапливаются).
+
+            resp.set_cookie("sid", token, max_age=3600, secure=True)
+
+        Значения безопасные по умолчанию: HttpOnly и SameSite=Lax. Secure включайте
+        под HTTPS. expires — datetime (naive считается UTC). Недопустимые символы в
+        имени, значении или атрибутах → ValueError (значение с ';', пробелом, кавычкой,
+        запятой, '\\' или не-ASCII закодируйте: urllib.parse.quote).
+        Возвращает self.
+        """
+        if _TOKEN.fullmatch(name) is None:
+            raise ValueError(f"invalid cookie name {name!r}")
+        if _COOKIE_VALUE_BAD.search(value) is not None:
+            raise ValueError("invalid cookie value: ';', ',', '\\', quotes, whitespace, "
+                             "control and non-ASCII characters are not allowed (urllib.parse.quote it)")
+        cdef list parts = [name + "=" + value]
+        if max_age is not None:
+            parts.append("Max-Age=" + str(int(max_age)))
+        if expires is not None:
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            parts.append("Expires=" + format_datetime(expires.astimezone(timezone.utc), usegmt=True))
+        if path:
+            _check_attr("path", path)
+            parts.append("Path=" + path)
+        if domain:
+            _check_attr("domain", domain)
+            parts.append("Domain=" + domain)
+        if secure:
+            parts.append("Secure")
+        if httponly:
+            parts.append("HttpOnly")
+        if samesite is not None:
+            ss = str(samesite).lower()
+            if ss not in ("lax", "strict", "none"):
+                raise ValueError(f"samesite must be 'lax', 'strict', 'none' or None, got {samesite!r}")
+            if ss == "none" and not secure:
+                raise ValueError("SameSite=None requires secure=True (browsers reject it otherwise)")
+            parts.append("SameSite=" + ss.capitalize())
+
+        cookie = "; ".join(parts)
+        cur = self.headers.get("Set-Cookie")
+        if cur is None:
+            self.headers["Set-Cookie"] = [cookie]
+        elif type(cur) is str:
+            self.headers["Set-Cookie"] = [cur, cookie]
+        else:
+            cur.append(cookie)
+        return self
+
+    def delete_cookie(self, str name, *, str path = "/", object domain = None,
+                      bint secure = False, bint httponly = True, object samesite = "lax"):
+        """Удалить cookie у клиента (path и domain должны совпадать с теми, что при установке)."""
+        return self.set_cookie(name, "", max_age=0, expires=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                               path=path, domain=domain, secure=secure, httponly=httponly,
+                               samesite=samesite)
+
     cpdef bytes render(self, bint keep_alive = True, bint head = False):
         """
         Сериализовать в HTTP/1.1 wire-формат.
@@ -390,18 +517,24 @@ cdef class Response:
         buf += _CONN_KA if keep_alive else _CONN_CL
         buf += cl_header
 
-        # пользовательские заголовки
-        cdef str k, v
+        # пользовательские заголовки; значение — str или список str (несколько строк,
+        # нужно для Set-Cookie)
+        cdef str k
+        cdef object v, item
         cdef bytes kline
         for k, v in self.headers.items():
             kline = _HEADER_KEYS.get(k)      # "Content-Type" → b"Content-Type: " один раз
             if kline is None:
-                kline = k.encode("latin-1") + b": "
-                if len(_HEADER_KEYS) < 256:
-                    _HEADER_KEYS[k] = kline
-            buf += kline
-            buf += v.encode("latin-1")
-            buf += _CRLF
+                kline = _header_key(k)
+            if type(v) is str:
+                buf += kline
+                buf += _header_value(k, v)
+                buf += _CRLF
+            else:
+                for item in v:
+                    buf += kline
+                    buf += _header_value(k, item)
+                    buf += _CRLF
 
         buf += _CRLF
 
