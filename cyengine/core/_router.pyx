@@ -24,9 +24,13 @@ cdef int PARAM_PATH = 2 # lazy
 
 cdef inline object _coerce(int kind, str value):
     if kind == PARAM_INT:
+        # int() слишком мягкий: принимает "4_2", " 42", "+5", арабо-индийские цифры.
+        # Для id в пути допускаем только ASCII-цифры (isdigit без isascii пропустил бы "²").
+        if not (value.isascii() and value.isdigit()):
+            return None
         try:
             return int(value)
-        except ValueError:
+        except ValueError:      # слишком длинное число: лимит цифр у int() в Python
             return None
 
     return value
